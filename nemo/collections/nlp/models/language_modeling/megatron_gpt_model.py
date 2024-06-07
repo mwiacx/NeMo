@@ -23,27 +23,31 @@ from importlib.metadata import version
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
-from omegaconf import OmegaConf
-from omegaconf.dictconfig import DictConfig
-from pkg_resources import packaging
-from pytorch_lightning.accelerators import CPUAccelerator
-from pytorch_lightning.loops.fetchers import _DataFetcherWrapper
-from pytorch_lightning.trainer.trainer import Trainer
-
 from nemo.collections.common.parts.utils import extend_instance
 from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingRandomSampler,
     MegatronPretrainingSampler,
 )
-from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import build_train_valid_test_datasets
-from nemo.collections.nlp.data.language_modeling.megatron.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from nemo.collections.nlp.models.language_modeling.megatron.falcon.falcon_spec import get_falcon_layer_spec
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import (
+    build_train_valid_test_datasets,
+)
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_fim_dataset import (
+    GPTFIMDataset,
+    GPTFIMDatasetConfig,
+)
+from nemo.collections.nlp.models.language_modeling.megatron.falcon.falcon_spec import (
+    get_falcon_layer_spec,
+)
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_full_te_layer_autocast_spec import (
     get_gpt_full_te_layer_autocast_spec,
 )
-from nemo.collections.nlp.models.language_modeling.megatron.gpt_layer_modelopt_spec import get_gpt_layer_modelopt_spec
+from nemo.collections.nlp.models.language_modeling.megatron.gpt_layer_modelopt_spec import (
+    get_gpt_layer_modelopt_spec,
+)
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_model import GPTModel
-from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
+from nemo.collections.nlp.models.language_modeling.megatron_base_model import (
+    MegatronBaseModel,
+)
 from nemo.collections.nlp.modules.common.megatron.build_model import build_model
 from nemo.collections.nlp.modules.common.megatron.module import Float16Module
 from nemo.collections.nlp.modules.common.megatron.utils import (
@@ -53,7 +57,9 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     get_ltor_masks_and_position_ids,
     get_params_for_weight_decay_optimization,
 )
-from nemo.collections.nlp.modules.common.text_generation_strategy import TextGenerationStrategy
+from nemo.collections.nlp.modules.common.text_generation_strategy import (
+    TextGenerationStrategy,
+)
 from nemo.collections.nlp.modules.common.text_generation_utils import (
     generate,
     get_computeprob_response,
@@ -74,6 +80,12 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, NeuralType
 from nemo.utils import logging
 from nemo.utils.te_utils import is_float8tensor
+from omegaconf import OmegaConf
+from omegaconf.dictconfig import DictConfig
+from pkg_resources import packaging
+from pytorch_lightning.accelerators import CPUAccelerator
+from pytorch_lightning.loops.fetchers import _DataFetcherWrapper
+from pytorch_lightning.trainer.trainer import Trainer
 
 try:
     import apex.transformer.pipeline_parallel.utils
@@ -87,13 +99,25 @@ except (ImportError, ModuleNotFoundError):
 
 try:
     from megatron.core import InferenceParams, parallel_state, tensor_parallel
-    from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-    from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+    from megatron.core.datasets.blended_megatron_dataset_builder import (
+        BlendedMegatronDatasetBuilder,
+    )
+    from megatron.core.datasets.gpt_dataset import (
+        GPTDataset,
+        GPTDatasetConfig,
+        MockGPTDataset,
+    )
     from megatron.core.datasets.utils import get_blend_from_list
     from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-    from megatron.core.dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject
+    from megatron.core.dist_checkpointing.mapping import (
+        LocalNonpersitentObject,
+        ShardedObject,
+    )
     from megatron.core.distributed import DistributedDataParallel as McoreDDP
-    from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
+    from megatron.core.distributed import (
+        DistributedDataParallelConfig,
+        finalize_model_grads,
+    )
 
     # NeMo's implementation of the get_gpt_layer_ammo_spec function is temporarily used
     # from megatron.core.inference.gpt.model_specs import get_gpt_layer_ammo_spec
@@ -903,6 +927,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     torch.distributed.send(loss_mean, 0)
                 elif torch.distributed.get_rank() == 0:
                     torch.distributed.recv(loss_mean, get_last_rank())
+
+            self.log('step', self.trainer.global_step, prog_bar=True, rank_zero_only=True, batch_size=1)
             self.log('reduced_train_loss', loss_mean, prog_bar=True, rank_zero_only=True, batch_size=1)
 
             # (@adithyare) we need to check for the _scaler attribute to enable pp>1 for adapter training
@@ -922,6 +948,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         )
 
         consumed_samples = self._compute_consumed_samples_after_training_step()
+        num_consumed_tokens = consumed_samples * self.cfg.get('encoder_seq_length')
         # TODO: make sure compute_consumed_samples works for pipeline parallelism
         self.log(
             'consumed_samples',
@@ -929,6 +956,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             prog_bar=True,
             rank_zero_only=True,
             batch_size=1,
+        )
+        self.log(
+            'num_consumed_tokens', num_consumed_tokens, prog_bar=True, rank_zero_only=True, batch_size=1,
         )
 
         if self.rampup_batch_size:

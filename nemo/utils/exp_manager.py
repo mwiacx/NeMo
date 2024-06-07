@@ -28,14 +28,6 @@ import pytorch_lightning
 import torch
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import get_original_cwd
-from omegaconf import DictConfig, OmegaConf, open_dict
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.callbacks.timer import Interval, Timer
-from pytorch_lightning.loggers import MLFlowLogger, NeptuneLogger, TensorBoardLogger, WandbLogger
-from pytorch_lightning.loops import _TrainingEpochLoop
-from pytorch_lightning.strategies.ddp import DDPStrategy
-
 from nemo.collections.common.callbacks import EMA
 from nemo.constants import NEMO_ENV_VARNAME_TESTING, NEMO_ENV_VARNAME_VERSION
 from nemo.utils import logging, timers
@@ -45,9 +37,27 @@ from nemo.utils.env_var_parsing import get_envbool
 from nemo.utils.exceptions import NeMoBaseException
 from nemo.utils.get_rank import is_global_rank_zero
 from nemo.utils.lightning_logger_patch import add_filehandlers_to_pl_logger
-from nemo.utils.loggers import ClearMLLogger, ClearMLParams, DLLogger, DLLoggerParams, MLFlowParams
+from nemo.utils.loggers import (
+    ClearMLLogger,
+    ClearMLParams,
+    DLLogger,
+    DLLoggerParams,
+    MLFlowParams,
+)
 from nemo.utils.mcore_logger import add_handlers_to_mcore_logger
 from nemo.utils.model_utils import uninject_model_parallel_rank
+from omegaconf import DictConfig, OmegaConf, open_dict
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks.timer import Interval, Timer
+from pytorch_lightning.loggers import (
+    MLFlowLogger,
+    NeptuneLogger,
+    TensorBoardLogger,
+    WandbLogger,
+)
+from pytorch_lightning.loops import _TrainingEpochLoop
+from pytorch_lightning.strategies.ddp import DDPStrategy
 
 
 class NotFoundError(NeMoBaseException):
@@ -177,6 +187,10 @@ class ExpManagerConfig:
     max_time_per_run: Optional[str] = None
     # time to sleep non 0 ranks during initialization
     seconds_to_sleep: float = 5
+    # global_batch_tokens = global_batch_size * encoder_seq_length
+    # gpu_num = num_nodes * devices
+    global_batch_tokens: Optional[int] = None
+    gpu_num: Optional[int] = None
 
 
 class TimingCallback(Callback):
@@ -184,8 +198,10 @@ class TimingCallback(Callback):
     Logs execution time of train/val/test steps
     """
 
-    def __init__(self, timer_kwargs={}):
+    def __init__(self, global_batch_tokens, gpu_num, timer_kwargs={}):
         self.timer = timers.NamedTimer(**timer_kwargs)
+        self.global_batch_tokens = global_batch_tokens
+        self.gpu_num = gpu_num
 
     def _on_batch_start(self, name):
         # reset only if we do not return mean of a sliding window
@@ -212,6 +228,17 @@ class TimingCallback(Callback):
             batch_size=1,
             prog_bar=(name == "train_step_timing"),
         )
+
+        if name == "train_step_timing":
+            tgs = self.global_batch_tokens / self.gpu_num / self.timer[name]
+            pl_module.log(
+                'tgs',
+                tgs,
+                on_step=True,
+                on_epoch=False,
+                batch_size=1,
+                prog_bar=True,
+            )
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         self._on_batch_start("train_step_timing")
@@ -449,7 +476,7 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
 
     # add loggers timing callbacks
     if cfg.log_step_timing:
-        timing_callback = TimingCallback(timer_kwargs=cfg.step_timing_kwargs or {})
+        timing_callback = TimingCallback(cfg.global_batch_tokens, cfg.gpu_num, timer_kwargs=cfg.step_timing_kwargs or {})
         trainer.callbacks.insert(0, timing_callback)
 
     if cfg.ema.enable:
