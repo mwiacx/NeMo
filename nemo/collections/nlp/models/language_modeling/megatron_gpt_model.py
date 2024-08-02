@@ -22,32 +22,46 @@ from functools import cache, partial
 from importlib.metadata import version
 from typing import Any, Dict, Iterator, List, Optional, Union
 
+import numpy as np
+import scipy
 import torch
+from omegaconf import OmegaConf
+from omegaconf.dictconfig import DictConfig
+from pkg_resources import packaging
+from pytorch_lightning.accelerators import CPUAccelerator
+from pytorch_lightning.loops.fetchers import _DataFetcherWrapper
+from pytorch_lightning.trainer.trainer import Trainer
+from torch import distributed as dist
+
 from nemo.collections.common.parts.utils import extend_instance
 from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingRandomSampler,
     MegatronPretrainingSampler,
 )
-from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import (
-    build_train_valid_test_datasets,
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import build_train_valid_test_datasets
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from nemo.collections.nlp.data.language_modeling.megatron.internlm.batch_sampler import (
+    StaticBatchSampler,
+    get_dpsampler_dataloader,
 )
-from nemo.collections.nlp.data.language_modeling.megatron.gpt_fim_dataset import (
-    GPTFIMDataset,
-    GPTFIMDatasetConfig,
+from nemo.collections.nlp.data.language_modeling.megatron.internlm.collaters import (
+    jsonl_ds_collate_fn,
+    packed_collate_fn,
 )
-from nemo.collections.nlp.models.language_modeling.megatron.falcon.falcon_spec import (
-    get_falcon_layer_spec,
+from nemo.collections.nlp.data.language_modeling.megatron.internlm.dataset import get_dataset_dict
+from nemo.collections.nlp.data.language_modeling.megatron.internlm.dummy_dataset import RandomDataset
+from nemo.collections.nlp.data.language_modeling.megatron.internlm.packed_dataset import (
+    PackedDatasetWithCut,
+    PackedDatasetWithoutCuSeqlen,
+    get_packed_dataset_without_short_length,
 )
+from nemo.collections.nlp.models.language_modeling.megatron.falcon.falcon_spec import get_falcon_layer_spec
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_full_te_layer_autocast_spec import (
     get_gpt_full_te_layer_autocast_spec,
 )
-from nemo.collections.nlp.models.language_modeling.megatron.gpt_layer_modelopt_spec import (
-    get_gpt_layer_modelopt_spec,
-)
+from nemo.collections.nlp.models.language_modeling.megatron.gpt_layer_modelopt_spec import get_gpt_layer_modelopt_spec
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_model import GPTModel
-from nemo.collections.nlp.models.language_modeling.megatron_base_model import (
-    MegatronBaseModel,
-)
+from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
 from nemo.collections.nlp.modules.common.megatron.build_model import build_model
 from nemo.collections.nlp.modules.common.megatron.module import Float16Module
 from nemo.collections.nlp.modules.common.megatron.utils import (
@@ -57,9 +71,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     get_ltor_masks_and_position_ids,
     get_params_for_weight_decay_optimization,
 )
-from nemo.collections.nlp.modules.common.text_generation_strategy import (
-    TextGenerationStrategy,
-)
+from nemo.collections.nlp.modules.common.text_generation_strategy import TextGenerationStrategy
 from nemo.collections.nlp.modules.common.text_generation_utils import (
     generate,
     get_computeprob_response,
@@ -80,12 +92,6 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, NeuralType
 from nemo.utils import logging
 from nemo.utils.te_utils import is_float8tensor
-from omegaconf import OmegaConf
-from omegaconf.dictconfig import DictConfig
-from pkg_resources import packaging
-from pytorch_lightning.accelerators import CPUAccelerator
-from pytorch_lightning.loops.fetchers import _DataFetcherWrapper
-from pytorch_lightning.trainer.trainer import Trainer
 
 try:
     import apex.transformer.pipeline_parallel.utils
@@ -99,25 +105,13 @@ except (ImportError, ModuleNotFoundError):
 
 try:
     from megatron.core import InferenceParams, parallel_state, tensor_parallel
-    from megatron.core.datasets.blended_megatron_dataset_builder import (
-        BlendedMegatronDatasetBuilder,
-    )
-    from megatron.core.datasets.gpt_dataset import (
-        GPTDataset,
-        GPTDatasetConfig,
-        MockGPTDataset,
-    )
+    from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+    from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
     from megatron.core.datasets.utils import get_blend_from_list
     from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-    from megatron.core.dist_checkpointing.mapping import (
-        LocalNonpersitentObject,
-        ShardedObject,
-    )
+    from megatron.core.dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject
     from megatron.core.distributed import DistributedDataParallel as McoreDDP
-    from megatron.core.distributed import (
-        DistributedDataParallelConfig,
-        finalize_model_grads,
-    )
+    from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
 
     # NeMo's implementation of the get_gpt_layer_ammo_spec function is temporarily used
     # from megatron.core.inference.gpt.model_specs import get_gpt_layer_ammo_spec
@@ -425,6 +419,43 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if self.use_loss_mask and self.transformer_config.sequence_parallel:
             raise ValueError('Loss mask is not supported with sequence parallelism.')
 
+        torch_profiler_config = cfg.get("pytorch_profiler", dict(enable=False, trace_path_prefix="./"))
+
+        self._pytorch_current_step = 0
+        self._pytorch_max_step = 0
+        self._pytorch_profiler = None
+        self._pytorch_profiler_started = False
+        self._pytorch_profiler_enable = torch_profiler_config.get("enable", "False")
+        self._pytorch_profiler_prefix = torch_profiler_config.get("trace_path_prefix", "./")
+
+        # for benchmark
+        self._BENCHMARK_MODE = True
+        self._static_attention_mask = None
+        self._static_position_ids = None
+
+    def get_pytorch_profiler(self, trace_path_prefix):
+        if self._pytorch_profiler_enable == "False" or self._pytorch_profiler_enable is False:
+            return None, 20  # For Test
+
+        schedule_config = {"wait": 1, "warmup": 1, "active": 1, "repeat": 1, "skip_first": 8}
+        trace_path = (
+            f"{trace_path_prefix}/rank{dist.get_rank()}_"
+            f"dp{parallel_state.get_data_parallel_rank()}_"
+            f"tp{parallel_state.get_tensor_model_parallel_rank()}_"
+            f"pp{parallel_state.get_pipeline_model_parallel_rank()}"
+        )
+
+        llm_profile = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(**schedule_config),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_path),
+            with_stack=True,
+            with_modules=True,
+            profile_memory=True,
+        )
+
+        return llm_profile, 1 + 1 + 1 + 8
+
     def set_inference_config(self, inference_config):
         self._inference_config = inference_config
 
@@ -704,17 +735,46 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         # we do this inside training_step to support pipeline parallelism
         fwd_bwd_function = get_forward_backward_func()
 
+        def _inner_fwd_bwd_function_with_profiling():
+            if self._pytorch_profiler_started is False:
+                self._pytorch_profiler_started = True
+                self._pytorch_profiler, self._pytorch_max_step = self.get_pytorch_profiler(
+                    self._pytorch_profiler_prefix
+                )
+                if self._pytorch_profiler is not None:
+                    self._pytorch_profiler.__enter__()
+                    # if dist.get_rank() == 0:
+                    print(f"rank{dist.get_rank()}: Enable Pytorch Profiler!", flush=True)
+
+            _ret = fwd_bwd_function(
+                forward_step_func=self.get_forward_output_and_loss_func(forward_only),
+                data_iterator=self._make_data_iterator_list(dataloader_iter),
+                model=self.model,
+                num_microbatches=get_num_microbatches(),
+                forward_only=forward_only,
+                seq_length=self.cfg.encoder_seq_length,
+                micro_batch_size=self.cfg.micro_batch_size,
+                first_val_step=first_val_step,
+            )
+
+            self._pytorch_current_step += 1
+            if self._pytorch_profiler_started is True and self._pytorch_profiler is not None:
+                if self._pytorch_current_step > self._pytorch_max_step:
+                    self._pytorch_profiler.__exit__(None, None, None)
+                self._pytorch_profiler.step()
+
+                # if dist.get_rank() == 0:
+
+            # torch.distributed.barrier()
+            print(f"rank{dist.get_rank()}: step {self._pytorch_current_step}", flush=True)
+
+            if self._pytorch_current_step > self._pytorch_max_step:
+                import sys; sys.exit(-1)
+
+            return _ret
+
         # TODO @akhattar: add num_micro_batches_with_partial_activation_checkpoints when ready
-        losses_reduced_per_micro_batch = fwd_bwd_function(
-            forward_step_func=self.get_forward_output_and_loss_func(forward_only),
-            data_iterator=self._make_data_iterator_list(dataloader_iter),
-            model=self.model,
-            num_microbatches=get_num_microbatches(),
-            forward_only=forward_only,
-            seq_length=self.cfg.encoder_seq_length,
-            micro_batch_size=self.cfg.micro_batch_size,
-            first_val_step=first_val_step,
-        )
+        losses_reduced_per_micro_batch = _inner_fwd_bwd_function_with_profiling()
 
         # only the last stages of the pipeline return losses
         if losses_reduced_per_micro_batch:
@@ -958,7 +1018,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             batch_size=1,
         )
         self.log(
-            'num_consumed_tokens', num_consumed_tokens, prog_bar=True, rank_zero_only=True, batch_size=1,
+            'num_consumed_tokens',
+            num_consumed_tokens,
+            prog_bar=True,
+            rank_zero_only=True,
+            batch_size=1,
         )
 
         if self.rampup_batch_size:
@@ -1189,8 +1253,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         return batch
 
     def get_forward_output_and_loss_func(self, validation_step=False, tuning=False):
-        def fwd_output_and_loss_func(dataloader_iter, model, checkpoint_activations_all_layers=None):
-
+        def fwd_output_and_loss_func_megatron(dataloader_iter, model, checkpoint_activations_all_layers=None):
             # Get data batch
             batch = self.get_batch(dataloader_iter, tuning)
 
@@ -1311,7 +1374,196 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
             return output_tensor, loss_func
 
-        return fwd_output_and_loss_func
+        def fwd_output_and_loss_func_internlm(
+            dataloader_iter,
+            model,
+            checkpoint_activations_all_layers=None,
+        ):
+            # Get data batch
+            tmp_batch = next(dataloader_iter)
+            ins = tmp_batch[0][0]
+
+            if self._BENCHMARK_MODE is True:
+                # print(f"cu_seqlens: {ins['cu_seqlens'][0]}", flush=True)
+                if self._static_position_ids is None:
+                    if self.get_attention_mask_from_fusion:
+                        self._static_attention_mask = None
+                    else:
+                        self._static_attention_mask = scipy.linalg.block_diag(
+                            *[
+                                np.tril(np.ones((l2 - l1, l2 - l1), dtype=bool))
+                                for l1, l2 in zip(ins['cu_seqlens'][0][:-1], ins['cu_seqlens'][0][1:])
+                            ]
+                        )
+                        self._static_attention_mask = torch.tensor(
+                            self._static_attention_mask, dtype=torch.int32, device=ins['input_ids'].device
+                        ).reshape(1, 1, len(self._static_attention_mask), len(self._static_attention_mask))                        
+
+                    self._static_position_ids = list(
+                        itertools.chain(
+                            *[np.arange(l2 - l1) for l1, l2 in zip(ins['cu_seqlens'][0][:-1], ins['cu_seqlens'][0][1:])]
+                        )
+                    )
+                    self._static_position_ids = torch.tensor(
+                        self._static_position_ids, dtype=torch.int32, device=ins['input_ids'].device
+                    ).reshape(1, len(self._static_position_ids))
+
+                attention_mask, position_ids = self._static_attention_mask, self._static_position_ids
+            else:
+                attention_mask = scipy.linalg.block_diag(
+                    *[
+                        np.tril(np.ones((l2 - l1, l2 - l1), dtype=bool))
+                        for l1, l2 in zip(ins['cu_seqlens'][0][:-1], ins['cu_seqlens'][0][1:])
+                    ]
+                )
+                attention_mask = torch.tensor(attention_mask, dtype=torch.int32).reshape(
+                    1, 1, len(attention_mask), len(attention_mask)
+                )
+                position_ids = list(
+                    itertools.chain(
+                        *[np.arange(l2 - l1) for l1, l2 in zip(ins['cu_seqlens'][0][:-1], ins['cu_seqlens'][0][1:])]
+                    )
+                )
+                position_ids = torch.tensor(position_ids, dtype=torch.int32, device=ins['input_ids'].device).reshape(
+                    1, len(position_ids)
+                )
+
+            labels = tmp_batch[0][1]
+            loss_mask = labels != -100  # todo: check 1 is valid or 0 is valid
+
+            batch = {
+                'tokens': ins['input_ids'],
+                'position_ids': position_ids,
+                'attention_mask': attention_mask,
+                'labels': labels,
+                'loss_mask': loss_mask,
+            }
+
+            # Transfer needed data to GPU
+            required_keys = set()
+            max_seqlen = batch['max_seqlen'].squeeze() if 'max_seqlen' in batch else None
+            cu_seqlens_argmin = batch['cu_seqlens_argmin'] if 'cu_seqlens_argmin' in batch else None
+            if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+                required_keys.update(batch.keys())
+            else:
+                required_keys.add('attention_mask')
+                if 'cu_seqlens' in batch:
+                    required_keys.add('cu_seqlens')
+                if parallel_state.is_pipeline_first_stage():
+                    required_keys.update(('tokens', 'position_ids'))
+                if parallel_state.is_pipeline_last_stage():
+                    required_keys.update(('labels', 'loss_mask'))
+            if self.get_attention_mask_from_fusion and 'attention_mask' in required_keys:
+                required_keys.remove('attention_mask')
+            batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in batch.items()}
+
+            # slice batch along sequence dimension for context parallelism
+            batch = self.get_batch_on_this_context_parallel_rank(batch)
+
+            # Model forward pass
+            forward_args = {
+                'input_ids': batch['tokens'],
+                'position_ids': batch['position_ids'],
+                'attention_mask': None if self.get_attention_mask_from_fusion else batch['attention_mask'],
+                'labels': batch['labels'] if 'labels' in batch else None,
+                'loss_mask': batch['loss_mask'],
+            }
+
+            if dist.get_rank() == 0:
+                print(f"forward_args: {forward_args}", flush=True)
+
+            if not self.mcore_gpt:
+                forward_args['checkpoint_activations_all_layers'] = checkpoint_activations_all_layers
+                if not self.use_loss_mask:
+                    forward_args.pop('loss_mask')
+            else:
+                # TODO: @eharper can we add this to mcore?
+                forward_args.pop('loss_mask')
+
+                if 'cu_seqlens' in batch:  # packed sequence from GPTSFTPackedDataset
+                    # these args are passed eventually into TEDotProductAttention.forward()
+                    cu_seqlens = batch['cu_seqlens'].squeeze()  # remove batch size dimension (mbs=1)
+                    # remove -1 "paddings" added in collate_fn
+                    if cu_seqlens_argmin is not None:
+                        cu_seqlens = cu_seqlens[: cu_seqlens_argmin.item()]
+                    else:
+                        cu_seqlens = cu_seqlens[: torch.argmin(cu_seqlens)]
+
+                    try:
+                        from megatron.core.packed_seq_params import PackedSeqParams
+                    except (ImportError, ModuleNotFoundError) as e:
+                        mcore_version = packaging.version.Version(version('megatron-core'))
+                        logging.error(
+                            f"megatron-core v{mcore_version} does not support training with packed sequence. "
+                            "Please use megatron-core >= 0.5.0, or set model.data.train_ds.packed_sequence=False"
+                        )
+                        raise e
+
+                    forward_args['packed_seq_params'] = PackedSeqParams(
+                        cu_seqlens_q=cu_seqlens,
+                        cu_seqlens_kv=cu_seqlens,
+                        max_seqlen_q=max_seqlen,
+                        max_seqlen_kv=max_seqlen,
+                        qkv_format='thd',
+                    )
+
+            output_tensor = model(**forward_args)
+
+            if dist.get_rank() == 0:
+                print(f"mem allocated: {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024}", flush=True)
+                torch.cuda.reset_peak_memory_stats()
+
+            def loss_func(output_tensor):
+                # Loss for a micro-batch (ub)
+                loss_for_ub = self.loss_func(batch['loss_mask'], batch['num_valid_tokens_in_ub'], output_tensor)
+                cp_size = parallel_state.get_context_parallel_world_size()
+                if self.return_output_tensors:
+                    # TODO: need a better way to check if loss_func is returning more stuff than just loss... (@adithyare)
+                    loss_for_ub, q_hs, d_hs, pos_cs, neg_cs, diff_cs = loss_for_ub
+                    reduced_loss = average_losses_across_data_parallel_group([loss_for_ub])
+                    pos_cs = average_losses_across_data_parallel_group([pos_cs])
+                    neg_cs = average_losses_across_data_parallel_group([neg_cs])
+                    diff_cs = average_losses_across_data_parallel_group([diff_cs])
+                    return (
+                        loss_for_ub * cp_size,
+                        {
+                            'avg': reduced_loss,
+                            'query_hs': q_hs,
+                            'doc_hs': d_hs,
+                            'avg_pos_cs': pos_cs,
+                            'avg_neg_cs': neg_cs,
+                            'diff_cs': diff_cs,
+                        },
+                    )
+                elif validation_step and not self.validation_drop_last:
+                    num_valid_tokens_in_ub = batch['num_valid_tokens_in_ub']
+                    if loss_for_ub.isnan():
+                        assert batch['loss_mask'].count_nonzero() == 0, 'Got NaN loss with non-empty input'
+                        loss_sum_for_ub = torch.zeros_like(loss_for_ub)
+                        num_valid_tokens_in_ub = 0
+                    else:
+                        if self.sample_weight == 'constant':
+                            num_valid_tokens_in_ub = 1
+                        loss_sum_for_ub = num_valid_tokens_in_ub * loss_for_ub
+
+                    loss_sum_and_ub_size_all_gpu = torch.cat(
+                        [
+                            loss_sum_for_ub.clone().detach().view(1),
+                            torch.tensor([num_valid_tokens_in_ub]).cuda().clone().detach(),
+                        ]
+                    )
+                    # Could potentially reduce num_valid_samples_in_microbatch and use that to aggregate instead of len(self._validation_ds)
+                    torch.distributed.all_reduce(
+                        loss_sum_and_ub_size_all_gpu, group=parallel_state.get_data_parallel_group()
+                    )
+                    return loss_for_ub * cp_size, {'loss_sum_and_ub_size': loss_sum_and_ub_size_all_gpu}
+                else:
+                    reduced_loss = average_losses_across_data_parallel_group([loss_for_ub])
+                    return loss_for_ub * cp_size, {'avg': reduced_loss}
+
+            return output_tensor, loss_func
+
+        return fwd_output_and_loss_func_internlm if self.cfg.data.use_internlm_dl else fwd_output_and_loss_func_megatron
 
     def get_forward_output_only_func(self):
         def fwd_output_only_func(dataloader_iter, model):
@@ -1349,11 +1601,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     extra_arg['inference_max_sequence_len'] = inference_max_sequence_len[0].item()
             # Currently for all MCore transformer layer specs causal attention mask
             # is used so we can delegate creating it to MCore/TE and pass None below
-            if (
-                isinstance(model, MCoreGPTModel)
-                or hasattr(model, "module")
-                and isinstance(model.module, MCoreGPTModel)
-            ):
+            if isinstance(model, MCoreGPTModel) or hasattr(model, "module") and isinstance(model.module, MCoreGPTModel):
                 attention_mask = None
             output_tensor = model(tokens, position_ids, attention_mask, **extra_arg)
 
@@ -1466,6 +1714,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         return loss
 
     def build_train_valid_test_datasets(self):
+        if self.cfg.data.use_internlm_dl:
+            return self.build_train_valid_test_datasets_internlm()
+        else:
+            return self.build_train_valid_test_datasets_megatron()
+
+    def build_train_valid_test_datasets_megatron(self):
         if self.trainer.limit_val_batches > 1.0 and isinstance(self.trainer.limit_val_batches, float):
             raise ValueError("limit_val_batches must be an integer or float less than or equal to 1.0.")
         logging.info('Building GPT datasets.')
@@ -1561,7 +1815,48 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         return self._train_ds, self._validation_ds, self._test_ds
 
+    def build_train_valid_test_datasets_internlm(self):
+        if self.cfg.data.train_folder is None or self.cfg.data.train_folder == "":
+            random_ds = RandomDataset(num_samples=1000000, max_len=self.cfg.encoder_seq_length)
+            if self.cfg.data.pack_sample_into_one:
+                self._train_ds = PackedDatasetWithoutCuSeqlen(
+                    random_ds,
+                    max_length_per_sample=self.cfg.encoder_seq_length,
+                    packed_length=self.cfg.micro_batch_size * self.cfg.encoder_seq_length,
+                )
+            else:
+                self._train_ds = PackedDatasetWithCut(
+                    random_ds,
+                    max_length_per_sample=self.cfg.encoder_seq_length,
+                    packed_length=self.cfg.micro_batch_size * self.cfg.encoder_seq_length,
+                    use_packed_dataset=self.cfg.data.use_packed_dataset,
+                    micro_bsz=self.cfg.micro_batch_size,
+                )
+        else:
+            self._train_ds = get_packed_dataset_without_short_length(
+                folder=self.cfg.data.train_folder,
+                packed_length=self.cfg.micro_batch_size * self.cfg.encoder_seq_length,
+                max_length_per_sample=self.cfg.encoder_seq_length,
+                show_progress=parallel_state.get_data_parallel_rank(),
+                min_length=self.cfg.data.min_length,
+                min_length_dict={},
+                pack_sample_into_one=self.cfg.data.pack_sample_into_one,
+            )
+        if self._train_ds is not None:
+            logging.info(f'Length of train dataset: {len(self._train_ds)}')
+        return self._train_ds
+
     def build_pretraining_data_loader(
+        self, dataset, consumed_samples, dataset_type=None, drop_last=True, pad_samples_to_global_batch_size=False
+    ):
+        if self.cfg.data.use_internlm_dl:
+            return self.build_pretraining_data_loader_internlm(dataset)
+        else:
+            return self.build_pretraining_data_loader_megatron(
+                dataset, consumed_samples, dataset_type=None, drop_last=True, pad_samples_to_global_batch_size=False
+            )
+
+    def build_pretraining_data_loader_megatron(
         self, dataset, consumed_samples, dataset_type=None, drop_last=True, pad_samples_to_global_batch_size=False
     ):
         """Buld dataloader given an input dataset."""
@@ -1603,6 +1898,32 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             persistent_workers=True if self.cfg.data.num_workers > 0 else False,
         )
 
+    def build_pretraining_data_loader_internlm(self, dataset):
+        assert isinstance(dataset, (PackedDatasetWithCut, PackedDatasetWithoutCuSeqlen, torch.utils.data.ConcatDataset))
+        # Create the training dataset sampler
+        train_sampler = StaticBatchSampler(
+            dataset.datasets if isinstance(dataset, torch.utils.data.ConcatDataset) else [dataset],
+            batch_size=1,  # for compatability with nemo-megatron input tensor shape
+            rampup_batch_size=self.cfg.get('rampup_batch_size', None),
+            micro_bsz=self.cfg.micro_batch_size,
+            seed=1024,
+            drop_last=True,
+            data_rank=parallel_state.get_data_parallel_rank(),
+            data_world_size=parallel_state.get_data_parallel_world_size(),
+        )
+        train_collate_fn = partial(
+            packed_collate_fn, packed_length=self.cfg.micro_batch_size * self.cfg.encoder_seq_length
+        )
+        train_dl = torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_sampler=train_sampler,
+            num_workers=self.cfg.data.num_workers,
+            pin_memory=True,
+            collate_fn=train_collate_fn,
+            persistent_workers=self.cfg.data.num_workers,
+        )
+        return train_dl
+
     def setup(self, stage=None):
         """
         PTL hook that is executed after DDP spawns.
@@ -1641,8 +1962,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             # allowing restored models to optionally setup datasets
             self.build_train_valid_test_datasets()
             self.setup_training_data(self.cfg.data)
-            self.setup_validation_data(self.cfg.data)
-            self.setup_test_data(self.cfg.data)
+            # self.setup_validation_data(self.cfg.data)
+            # self.setup_test_data(self.cfg.data)
             # Override limit_train_batches in terms of num of microbatches
             self._reconfigure_limit_batches(self.trainer.limit_train_batches, self._train_dl, 'train')
             # Override limit_val_batches to be a multiple of num microbatches to prevent val_step from exiting in between a step
@@ -1659,7 +1980,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if hasattr(self, '_train_ds'):
             consumed_samples = self.compute_consumed_samples(0)
             logging.info(
-                f'Setting up train dataloader with len(len(self._train_ds)): {len(self._train_ds)} and consumed samples: {consumed_samples}'
+                f'Setting up train dataloader with len(self._train_ds): {len(self._train_ds)} and consumed samples: {consumed_samples}'
             )
             self._train_dl = self.build_pretraining_data_loader(self._train_ds, consumed_samples)
 
@@ -1667,7 +1988,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if hasattr(self, '_validation_ds'):
             consumed_samples = 0
             logging.info(
-                f'Setting up validation dataloader with len(len(self._validation_ds)): {len(self._validation_ds)} and consumed samples: {consumed_samples}'
+                f'Setting up validation dataloader with len(self._validation_ds): {len(self._validation_ds)} and consumed samples: {consumed_samples}'
             )
 
             drop_last = True
@@ -1688,7 +2009,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             if self._test_ds is not None:
                 consumed_samples = 0
                 logging.info(
-                    f'Setting up test dataloader with len(len(self._test_ds)): {len(self._test_ds)} and consumed samples: {consumed_samples}'
+                    f'Setting up test dataloader with len(self._test_ds): {len(self._test_ds)} and consumed samples: {consumed_samples}'
                 )
                 self._test_dl = self.build_pretraining_data_loader(self._test_ds, consumed_samples)
             else:
